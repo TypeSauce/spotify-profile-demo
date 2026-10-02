@@ -49,6 +49,56 @@ type DeezerRelease = {
   releaseDate: string;
 };
 
+type SpotifyTrackSearchResult = {
+  name: string;
+  artists: Array<{ name: string }>;
+  external_urls?: { spotify?: string };
+  uri: string;
+};
+
+type SpotifyTrackMatch = { url: string; uri: string };
+const spotifyTrackUrlCache = new Map<string, SpotifyTrackMatch | null>();
+let nextSpotifySearchAt = 0;
+
+function hasCachedSpotifyTrack(id: string) {
+  if (!spotifyTrackUrlCache.has(id)) {
+    try {
+      const cached = sessionStorage.getItem(`spotify-track:${id}`);
+      if (cached !== null) {
+        const parsed: unknown = JSON.parse(cached);
+        if (parsed === null || (
+          typeof parsed === 'object' && parsed !== null &&
+          'url' in parsed && typeof parsed.url === 'string' &&
+          'uri' in parsed && typeof parsed.uri === 'string'
+        )) {
+          spotifyTrackUrlCache.set(id, parsed as SpotifyTrackMatch | null);
+        }
+      }
+    } catch {
+      // Keep the in-memory cache available when browser storage is disabled.
+    }
+  }
+  return spotifyTrackUrlCache.has(id);
+}
+
+function getCachedSpotifyTrack(id: string) {
+  hasCachedSpotifyTrack(id);
+  return spotifyTrackUrlCache.get(id);
+}
+
+function cacheSpotifyTrack(id: string, match: SpotifyTrackMatch | null) {
+  spotifyTrackUrlCache.set(id, match);
+  try {
+    sessionStorage.setItem(`spotify-track:${id}`, JSON.stringify(match));
+  } catch {
+    // The in-memory cache still prevents repeat searches during this page session.
+  }
+}
+
+function normalizeMatchText(value: string) {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+}
+
 
 const clientId = import.meta.env.VITE_SPOTIFY_CLIENT_ID ?? '5b97ff95b5034a8aa4114c3c06564fe7';
 const redirectUri = import.meta.env.VITE_SPOTIFY_REDIRECT_URI ?? window.location.origin;
@@ -74,7 +124,7 @@ async function signIn() {
     client_id: clientId,
     response_type: 'code',
     redirect_uri: redirectUri,
-    scope: 'user-read-private user-read-email user-follow-read playlist-read-private',
+    scope: 'user-read-private user-read-email user-follow-read playlist-read-private playlist-modify-private',
     code_challenge_method: 'S256',
     code_challenge: challenge,
   });
@@ -144,6 +194,32 @@ async function fetchSpotifyJson<T>(url: string, accessToken: string): Promise<T>
   return data as T;
 }
 
+async function searchSpotifyTrack(release: DeezerRelease, accessToken: string): Promise<SpotifyTrackMatch | null> {
+  const query = new URLSearchParams({
+    q: `track:"${release.title.replace(/"/g, '')}" artist:"${release.artistName.replace(/"/g, '')}"`,
+    type: 'track',
+    limit: '5',
+  });
+  const result = await fetchSpotifyJson<{ tracks: { items: SpotifyTrackSearchResult[] } }>(
+    `https://api.spotify.com/v1/search?${query}`,
+    accessToken,
+  );
+  const expectedTitle = normalizeMatchText(release.title);
+  const expectedArtists = release.artistName.split(/,|&| feat\.? | featuring /i).map(normalizeMatchText).filter(Boolean);
+  const match = result.tracks.items.find((track) =>
+    normalizeMatchText(track.name) === expectedTitle &&
+    track.artists.some((artist) => expectedArtists.includes(normalizeMatchText(artist.name))) &&
+    Boolean(track.external_urls?.spotify) && Boolean(track.uri),
+  );
+  return match?.external_urls?.spotify && match.uri
+    ? { url: match.external_urls.spotify, uri: match.uri }
+    : null;
+}
+
+function wait(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
 async function fetchPublicPlaylists(accessToken: string, userId: string) {
   const playlists: SpotifyPlaylist[] = [];
   let offset = 0;
@@ -195,6 +271,7 @@ function Pagination({ label, page, pageCount, onPageChange }: {
 
 function App() {
   const [profile, setProfile] = React.useState<SpotifyProfile | null>(null);
+  const [spotifyAccessToken, setSpotifyAccessToken] = React.useState('');
   const [artists, setArtists] = React.useState<SpotifyArtist[]>([]);
   const [artistsTotal, setArtistsTotal] = React.useState(0);
   const [artistPage, setArtistPage] = React.useState(1);
@@ -207,6 +284,14 @@ function App() {
   const [artistsError, setArtistsError] = React.useState('');
   const [playlistsError, setPlaylistsError] = React.useState('');
   const [releasesError, setReleasesError] = React.useState('');
+  const [releaseSpotifyUrls, setReleaseSpotifyUrls] = React.useState<Record<string, string>>({});
+  const [releaseLinkStatuses, setReleaseLinkStatuses] = React.useState<Record<string, 'queued' | 'searching' | 'missing' | 'error'>>({});
+  const [playlistCreating, setPlaylistCreating] = React.useState(false);
+  const [playlistCreationMessage, setPlaylistCreationMessage] = React.useState<{ text: string; url?: string; error?: boolean } | null>(null);
+  const releaseQueue = React.useRef<DeezerRelease[]>([]);
+  const queuedReleaseIds = React.useRef(new Set<string>());
+  const linkWorkerRunning = React.useRef(false);
+  const activeReleaseIds = React.useRef(new Set<string>());
   const [error, setError] = React.useState('');
   const [loading, setLoading] = React.useState(false);
   const [artistsLoading, setArtistsLoading] = React.useState(false);
@@ -222,6 +307,7 @@ function App() {
     fetchSpotifyData()
       .then(async ({ profile: loadedProfile, accessToken }) => {
         setProfile(loadedProfile);
+        setSpotifyAccessToken(accessToken);
         setLoading(false);
         setArtistsLoading(true);
         setPlaylistsLoading(true);
@@ -256,11 +342,127 @@ function App() {
       .finally(() => setLoading(false));
   }, [hasCode]);
 
+  React.useEffect(() => {
+    activeReleaseIds.current = new Set(releases.map((release) => release.id));
+    releaseQueue.current = releaseQueue.current.filter((release) => activeReleaseIds.current.has(release.id));
+    for (const queuedId of queuedReleaseIds.current) {
+      if (!activeReleaseIds.current.has(queuedId)) queuedReleaseIds.current.delete(queuedId);
+    }
+    for (const release of releases) {
+      if (hasCachedSpotifyTrack(release.id)) {
+        const cached = getCachedSpotifyTrack(release.id);
+        if (cached) {
+          setReleaseSpotifyUrls((current) => ({ ...current, [release.id]: cached.url }));
+        } else {
+          setReleaseLinkStatuses((current) => ({ ...current, [release.id]: 'missing' }));
+        }
+        continue;
+      }
+      if (queuedReleaseIds.current.has(release.id)) continue;
+      queuedReleaseIds.current.add(release.id);
+      releaseQueue.current.push(release);
+      setReleaseLinkStatuses((current) => ({ ...current, [release.id]: 'queued' }));
+    }
+
+    if (spotifyAccessToken) void processReleaseLinkQueue(spotifyAccessToken);
+  }, [releases, spotifyAccessToken]);
+
+  async function processReleaseLinkQueue(accessToken: string) {
+    if (linkWorkerRunning.current) return;
+    linkWorkerRunning.current = true;
+    try {
+      while (releaseQueue.current.length > 0) {
+        const release = releaseQueue.current.shift()!;
+        if (!activeReleaseIds.current.has(release.id)) {
+          queuedReleaseIds.current.delete(release.id);
+          continue;
+        }
+        setReleaseLinkStatuses((current) => ({ ...current, [release.id]: 'searching' }));
+        try {
+          const delay = Math.max(0, nextSpotifySearchAt - Date.now());
+          if (delay > 0) await wait(delay);
+          if (!activeReleaseIds.current.has(release.id)) continue;
+          nextSpotifySearchAt = Date.now() + 1000;
+          const match = await searchSpotifyTrack(release, accessToken);
+          cacheSpotifyTrack(release.id, match);
+          if (match) {
+            setReleaseSpotifyUrls((current) => ({ ...current, [release.id]: match.url }));
+          } else {
+            setReleaseLinkStatuses((current) => ({ ...current, [release.id]: 'missing' }));
+          }
+        } catch {
+          setReleaseLinkStatuses((current) => ({ ...current, [release.id]: 'error' }));
+        } finally {
+          queuedReleaseIds.current.delete(release.id);
+        }
+      }
+    } finally {
+      linkWorkerRunning.current = false;
+      if (releaseQueue.current.length > 0) void processReleaseLinkQueue(accessToken);
+    }
+  }
+
+  function retryFailedTrackSearches() {
+    for (const release of releases) {
+      if (releaseLinkStatuses[release.id] !== 'error' || hasCachedSpotifyTrack(release.id)) continue;
+      queuedReleaseIds.current.add(release.id);
+      releaseQueue.current.push(release);
+      setReleaseLinkStatuses((current) => ({ ...current, [release.id]: 'queued' }));
+    }
+    if (spotifyAccessToken) void processReleaseLinkQueue(spotifyAccessToken);
+  }
+
+  async function createReleasePlaylist() {
+    if (playlistCreating || releases.length === 0) return;
+    const matchedTracks = releases
+      .map((release) => getCachedSpotifyTrack(release.id))
+      .filter((match): match is SpotifyTrackMatch => Boolean(match));
+    if (matchedTracks.length === 0) return;
+
+    setPlaylistCreating(true);
+    setPlaylistCreationMessage(null);
+    try {
+      const created = await fetch('https://api.spotify.com/v1/me/playlists', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${spotifyAccessToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: `New Releases - Last ${searchedReleaseDays ?? parsedReleaseDays} Days`,
+          description: `Recent releases from followed artists, collected by Spotify Profile Demo.`,
+          public: false,
+        }),
+      });
+      const playlist = await created.json();
+      if (!created.ok) throw new Error(playlist.error?.message ?? 'Spotify could not create the playlist.');
+
+      for (let start = 0; start < matchedTracks.length; start += 100) {
+        const response = await fetch(`https://api.spotify.com/v1/playlists/${playlist.id}/items`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${spotifyAccessToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uris: matchedTracks.slice(start, start + 100).map((track) => track.uri) }),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error?.message ?? 'Spotify could not add tracks to the playlist.');
+      }
+      setPlaylistCreationMessage({
+        text: `Created a private playlist with ${matchedTracks.length} matched songs.`,
+        url: playlist.external_urls?.spotify,
+      });
+    } catch (cause) {
+      setPlaylistCreationMessage({
+        text: cause instanceof Error ? cause.message : 'Could not create the Spotify playlist.',
+        error: true,
+      });
+    } finally {
+      setPlaylistCreating(false);
+    }
+  }
+
   async function scanAllReleases() {
     const isNewSearch = searchedReleaseDays !== parsedReleaseDays;
     if (releasesLoading || !validReleaseDays || (!isNewSearch && releaseScanProgress >= artists.length)) return;
     const startAt = isNewSearch ? 0 : releaseScanProgress;
     setReleasesError('');
+    if (isNewSearch) setPlaylistCreationMessage(null);
     setReleasesLoading(true);
     if (isNewSearch) setReleaseScanProgress(0);
     try {
@@ -291,6 +493,9 @@ function App() {
   const playlistPageCount = Math.ceil(playlists.length / itemsPerPage);
   const visibleArtists = artists.slice((artistPage - 1) * itemsPerPage, artistPage * itemsPerPage);
   const visiblePlaylists = playlists.slice((playlistPage - 1) * itemsPerPage, playlistPage * itemsPerPage);
+  const matchedReleaseCount = releases.filter((release) => Boolean(getCachedSpotifyTrack(release.id)?.uri)).length;
+  const pendingReleaseCount = releases.filter((release) => !hasCachedSpotifyTrack(release.id) && releaseLinkStatuses[release.id] !== 'error').length;
+  const failedReleaseCount = releases.filter((release) => releaseLinkStatuses[release.id] === 'error').length;
 
   return (
     <main className="page-shell">
@@ -401,11 +606,27 @@ function App() {
               ) : releases.length > 0 ? (
                 <div className="artist-list">
                   {releases.map((release) => (
-                    <a className="artist-row" href={release.trackUrl || release.albumUrl || '#'} key={release.id} target="_blank" rel="noreferrer">
+                    <a
+                      className="artist-row"
+                      href={releaseSpotifyUrls[release.id] || '#'}
+                      key={release.id}
+                      target={releaseSpotifyUrls[release.id] ? '_blank' : undefined}
+                      rel={releaseSpotifyUrls[release.id] ? 'noreferrer' : undefined}
+                      onClick={(event) => {
+                        if (!releaseSpotifyUrls[release.id]) event.preventDefault();
+                      }}
+                    >
                       {release.albumCover ? <img className="playlist-cover" src={release.albumCover} alt="" loading="lazy" /> : <span className="artist-placeholder playlist-cover" aria-hidden="true">&#9835;</span>}
                       <span className="artist-details">
                         <span className="artist-name">{release.title}</span>
                         <span className="artist-genres">{release.artistName} · {release.albumName}</span>
+                      </span>
+                      <span className="artist-link-mark">
+                        {releaseSpotifyUrls[release.id] ? 'Open Spotify' :
+                          releaseLinkStatuses[release.id] === 'searching' ? 'Searching Spotify…' :
+                            releaseLinkStatuses[release.id] === 'queued' ? 'Spotify search queued' :
+                              releaseLinkStatuses[release.id] === 'error' ? 'Search failed' :
+                                releaseLinkStatuses[release.id] === 'missing' ? 'No Spotify match' : 'Waiting for Spotify search'}
                       </span>
                       <time className="release-date" dateTime={release.releaseDate}>{new Date(`${release.releaseDate}T12:00:00`).toLocaleDateString()}</time>
                     </a>
@@ -416,6 +637,39 @@ function App() {
               ) : releaseScanProgress === 0 && !releasesLoading && !artistsLoading && !artistsError && artists.length > 0 ? (
                 <p className="empty-state">Start one scan to check all followed artists. Results will appear as each batch finishes.</p>
               ) : null}
+              {releases.length > 0 && (
+                <div className="release-playlist-actions">
+                  <p className="status">
+                    Spotify links: {matchedReleaseCount} of {releases.length} matched.
+                    {pendingReleaseCount > 0 ? ` ${pendingReleaseCount} still queued or searching.` : ''}
+                    {failedReleaseCount > 0 ? ` ${failedReleaseCount} search${failedReleaseCount === 1 ? '' : 'es'} failed.` : ''}
+                  </p>
+                  <button
+                    className="scan-button"
+                    onClick={() => void createReleasePlaylist()}
+                    disabled={playlistCreating || pendingReleaseCount > 0 || failedReleaseCount > 0 || matchedReleaseCount === 0}
+                  >
+                    {playlistCreating ? 'Creating Spotify playlist…' : `Add ${matchedReleaseCount} matched songs to a new private playlist`}
+                  </button>
+                  {failedReleaseCount > 0 && (
+                    <button className="reconnect-button" onClick={retryFailedTrackSearches} disabled={playlistCreating}>
+                      Retry failed Spotify searches
+                    </button>
+                  )}
+                  {playlistCreationMessage && (
+                    <p className={playlistCreationMessage.error ? 'error' : 'status'} role={playlistCreationMessage.error ? 'alert' : 'status'}>
+                      {playlistCreationMessage.text}{' '}
+                      {playlistCreationMessage.url && <a href={playlistCreationMessage.url} target="_blank" rel="noreferrer">Open playlist in Spotify</a>}
+                    </p>
+                  )}
+                  {playlistCreationMessage?.error && (
+                    <button className="reconnect-button" onClick={() => void signIn()}>
+                      Reconnect Spotify with playlist access
+                    </button>
+                  )}
+                  <p className="artist-genres">New playlists are private. Songs without a Spotify match are skipped.</p>
+                </div>
+              )}
               {releasesLoading && <p className="status">Checked {releaseScanProgress} of {artists.length} followed artists. Continuing automatically...</p>}
               {!artistsLoading && !artistsError && validReleaseDays && (searchedReleaseDays !== parsedReleaseDays || releaseScanProgress < artists.length) && (
                 <button className="scan-button" onClick={() => void scanAllReleases()} disabled={releasesLoading}>
